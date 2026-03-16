@@ -1,0 +1,16 @@
+{
+  "token":               "YOUR_DISCORD_SELFBOT_TOKEN",
+  "guildId":             "YOUR_DISCORD_GUILD_ID",
+  "channelId":           "YOUR_DISCORD_CHANNEL_ID",
+  "alwaysOnEmbed":       "YOUR_ALWAYS_ON_EMBED_URL",
+  "probeByteTarget":     52428800,
+  "probeTimeoutMs":      90000,
+  "preSessionMinutes":   15,
+  "postSessionMinutes":  60,
+  "calendarFile":        "f1-better-calendar.ics",
+  "tlsProxyPort":        18888,
+  "ppvEmbedBase":        "pooembed.eu",
+  "streamedEmbedBase":   "embedsports.top",
+  "ppvDomains":          ["ppv.to", "ppv.st", "ppv.cx", "ppv.sh", "ppv.la"],
+  "streamedDomains":     ["streamed.pk", "streami.su"]
+}

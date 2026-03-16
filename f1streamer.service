@@ -1,0 +1,18 @@
+[Unit]
+Description=F1 Stream Scheduler Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=YOUR_USERNAME
+WorkingDirectory=/path/to/f1streamer
+ExecStart=/usr/bin/node f1scheduler.js
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+Environment=NODE_ENV=production
+
+[Install]
+WantedBy=multi-user.target

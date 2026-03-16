@@ -1,0 +1,24 @@
+{
+  "name": "f1streamer",
+  "version": "1.0.0",
+  "description": "Self-hosted F1 live stream bot for Discord",
+  "main": "f1scheduler.js",
+  "scripts": {
+    "start": "node f1scheduler.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "MIT",
+  "repository": "",
+  "dependencies": {
+    "@dank074/discord-video-stream": "github:Discord-RE/Discord-video-stream",
+    "axios": "^1.13.5",
+    "discord.js-selfbot-v13": "^3.7.1",
+    "m3u8-parser": "^7.2.0",
+    "node-ical": "^0.25.2",
+    "puppeteer": "^24.37.2",
+    "puppeteer-extra": "^3.3.6",
+    "puppeteer-extra-plugin-adblocker": "^2.13.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2"
+  }
+}

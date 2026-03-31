@@ -49,17 +49,33 @@ const TLS_PROXY_PORT = 18888;
 const path = require('path');
 let tlsProxy = null;
 
+function spawnTlsProxyProcess(proxyScript) {
+    tlsProxy = spawn('python3', [proxyScript, String(TLS_PROXY_PORT)], {
+        stdio: ['ignore', 'pipe', 'pipe']
+    });
+    tlsProxy.stderr.on('data', () => {});
+    tlsProxy.on('exit', (code) => {
+        tlsProxy = null;
+        if (!isShuttingDown) {
+            info('⚠️', `TLS proxy died (code ${code}). Auto-restarting in 1s...`);
+            setTimeout(() => {
+                if (!isShuttingDown) spawnTlsProxyProcess(proxyScript);
+            }, 1000);
+        }
+    });
+    tlsProxy.on('error', (e) => {
+        info('⚠️', `TLS proxy error: ${e.message}`);
+        tlsProxy = null;
+    });
+}
+
 function startTlsProxy() {
     const proxyScript = path.join(__dirname, 'tls_proxy.py');
     return new Promise((resolve) => {
-        tlsProxy = spawn('python3', [proxyScript, String(TLS_PROXY_PORT)], {
-            stdio: ['ignore', 'pipe', 'pipe']
-        });
+        spawnTlsProxyProcess(proxyScript);
         tlsProxy.stdout.on('data', (d) => {
             if (d.toString().includes('READY')) resolve();
         });
-        tlsProxy.stderr.on('data', () => {});
-        tlsProxy.on('error', (e) => { console.error('TLS proxy failed: ' + e.message); resolve(); });
         setTimeout(resolve, 3000);
     });
 }
@@ -85,9 +101,10 @@ const AUDIO_TCP_PORT       = 19876;
 const AUDIO_BUFFER_SEGS    = 4;
 const VIDEO_BUFFER_SEGS    = 4;
 
-const PROBE_BYTES       = 15 * 1024 * 1024;
-const PROBE_TIMEOUT_MS  = 90000;
+const PROBE_BYTES       = config.probeByteTarget || 15 * 1024 * 1024;
+const PROBE_TIMEOUT_MS  = config.probeTimeoutMs  || 90000;
 const DASHBOARD_INTERVAL = 2000;
+const PLAY_STREAM_INIT_TIMEOUT_MS = 30000;
 
 const HWM_PROXY     = 32  * 1024 * 1024;
 const HWM_PROBE     = 16  * 1024 * 1024;
@@ -194,6 +211,7 @@ if (!TARGET_URL) { console.error('Usage: node streamer.js <embed-url|m3u8-url>')
 
 let isShuttingDown = false;
 let currentPlayer  = null;
+let activeBrowser  = null;
 let hlsProxyVideo  = null;
 let hlsProxyAudio  = null;
 let audioTcpServer = null;
@@ -249,6 +267,15 @@ function drawDash(force = false) {
     const uptime   = fmtUptime(now - dash.startMs);
 
     const proxyBytes = vs?.bytes || 0;
+
+    // Connection status indicator
+    const vc = streamer.voiceConnection;
+    const sc = vc?.streamConnection;
+    const connAlive = vc && !vc._closed && sc && !sc._closed;
+    const connBadge = connAlive
+        ? `${A.green}CONN${A.reset}`
+        : (vc && !vc._closed) ? `${A.yellow}SETUP${A.reset}` : `${A.red}DEAD${A.reset}`;
+
     const badge      = `${A.bgGreen}${A.bold} ● LIVE ${A.reset}`;
     const modeBadge  = dash.mode === 'REMUX' ? `${A.green}REMUX${A.reset}` : `${A.yellow}${dash.mode}${A.reset}`;
     
@@ -261,7 +288,7 @@ function drawDash(force = false) {
     const lines = [
         ` ╭${'─'.repeat(W_BOX - 2)}╮`,
         dLine(`${badge}  ⏱  ${A.bold}${uptime}${A.reset}   ${A.dim}CDN:${A.reset} ${A.cyan}${dash.host.slice(0, 35)}${A.reset}`),
-        dLine(`${A.dim}🎬${A.reset} ${A.bold}${dash.width}x${dash.height} @ ${dash.fps}fps${A.reset}   ${A.dim}MODE:${A.reset} ${modeBadge}`),
+        dLine(`${A.dim}🎬${A.reset} ${A.bold}${dash.width}x${dash.height} @ ${dash.fps}fps${A.reset}   ${A.dim}MODE:${A.reset} ${modeBadge}   ${A.dim}DC:${A.reset} ${connBadge}`),
         dLine(`${A.dim}📡 IN:${A.reset}  ${fmtRate(dash.vidRate).padEnd(10)} ${A.dim}(${vs?.segs||0} segs)${A.reset}  ➔   ${A.dim}OUT:${A.reset}  ${fmtRate(dash.outRate).padEnd(10)} ${A.dim}(DAVE E2EE)${A.reset}`),
         dLine(`${A.dim}💾 VOL:${A.reset} ${fmtBytes(proxyBytes).padEnd(10)} ${A.dim}proxy${A.reset}       ➔   ${A.dim}VOL:${A.reset}  ${fmtBytes(outBytes).padEnd(10)} ${A.dim}streamed${A.reset}`),
         ` ╰${'─'.repeat(W_BOX - 2)}╯`
@@ -303,11 +330,13 @@ function forceExit() {
     
     console.log(`\n${A.dim} Shutting down pipeline...${A.reset}`);
     
+    if (activeBrowser)  { activeBrowser.close().catch(() => {}); activeBrowser = null; }
     if (hlsProxyVideo)  hlsProxyVideo.stop();
     if (hlsProxyAudio)  hlsProxyAudio.stop();
     if (audioTcpServer) try { audioTcpServer.close(); } catch {}
     if (currentPlayer?.pid) treeKill(currentPlayer.pid, 'SIGKILL');
     stopTlsProxy();
+    httpAgent.destroy();
     try { streamer.stopStream(); }  catch {}
     try { streamer.leaveVoice(); }  catch {}
     try { client.destroy(); }       catch {}
@@ -472,6 +501,9 @@ class HLSProxy {
         this._pollMs     = 2000;
         this._lastSegSuccess   = Date.now();
         this._consecutiveErrMs = 0;
+        this._lastNewSegTime   = Date.now();
+        this._lastSeqSeen      = -1;
+        this._playlistStaleSince = 0;
     }
 
     _segKey(url) {
@@ -502,6 +534,8 @@ class HLSProxy {
 
     async _poll() {
         if (!this.running) return;
+        // Backpressure: if the consumer can't keep up, skip this poll to avoid memory bloat
+        if (this.output.writableLength >= this.output.writableHighWaterMark) return;
         try {
             const content = await httpGetText(this.playlistUrl, this.headers);
             if (content.includes('#EXT-X-STREAM-INF:') && !content.includes('#EXTINF:')) {
@@ -516,6 +550,14 @@ class HLSProxy {
             const { segments, targetDuration } = parseMediaPlaylist(content, this.playlistUrl);
 
             this._pollMs = Math.max(500, Math.min(Math.round(targetDuration * 300), 3000));
+
+            // Track playlist staleness — detect frozen CDN playlists
+            const maxSeq = segments.length ? segments[segments.length - 1].sequence : -1;
+            if (maxSeq > this._lastSeqSeen) {
+                this._lastSeqSeen = maxSeq;
+                this._lastNewSegTime = Date.now();
+            }
+            this._playlistStaleSince = Date.now() - this._lastNewSegTime;
 
             if (this.isFirstPoll)
                 info('📋', `[${this.label}] Playlist OK — ${segments.length} segs, poll=${this._pollMs}ms`);
@@ -607,8 +649,13 @@ function createProbeTee(src, targetBytes = PROBE_BYTES) {
     const chunks = []; let collected = 0, done = false, _res, _rej;
     const promise = new Promise((r, j) => { _res = r; _rej = j; });
 
+    const probeProcs = [];
     const tmr = setTimeout(() => {
-        if (!done) { done = true; _rej(new Error(`probe timeout ${PROBE_TIMEOUT_MS/1000}s`)); }
+        if (!done) {
+            done = true;
+            probeProcs.forEach(p => { try { p.kill('SIGKILL'); } catch {} });
+            _rej(new Error(`probe timeout ${PROBE_TIMEOUT_MS/1000}s`));
+        }
     }, PROBE_TIMEOUT_MS);
 
     const REPORT_EVERY = 20 * 1024 * 1024;
@@ -637,6 +684,7 @@ function createProbeTee(src, targetBytes = PROBE_BYTES) {
                         const p1 = new Promise((resolve) => {
                             const proc = spawn('ffprobe', ['-v', 'quiet', '-analyzeduration', '15000000', '-probesize', '15000000',
                                 '-print_format', 'json', '-show_format', '-show_streams', '-i', 'pipe:0']);
+                            probeProcs.push(proc);
                             let raw = '';
                             proc.stdout.on('data', d => { raw += d; });
                             proc.on('close', (code) => resolve({ code, raw }));
@@ -652,6 +700,7 @@ function createProbeTee(src, targetBytes = PROBE_BYTES) {
                                 '-of', 'csv=p=0',
                                 '-i', 'pipe:0'
                             ]);
+                            probeProcs.push(proc);
                             let raw = '';
                             proc.stdout.on('data', d => { raw += d; });
                             proc.on('close', (code) => resolve({ code, raw }));
@@ -771,7 +820,6 @@ function startAudioTcpServer(audioStream, port) {
             info('🔌', `FFmpeg connected to dual-audio TCP socket on :${port}`);
             socket.on('error', () => {});
 
-            // ADD: timeout handling
             socket.setTimeout(10000);
             socket.on('timeout', () => {
                 info('⚠️', 'Audio TCP socket timed out — destroying');
@@ -782,10 +830,21 @@ function startAudioTcpServer(audioStream, port) {
             audioStream.pipe(socket);
             audioStream.on('end', () => socket.destroy());
         });
+        let addrRetries = 0;
+        server.on('error', (e) => {
+            if (e.code === 'EADDRINUSE' && addrRetries < 5) {
+                addrRetries++;
+                info('⚠️', `Audio TCP port ${port} still in TIME_WAIT — retry ${addrRetries}/5 in 1s...`);
+                setTimeout(() => {
+                    server.listen(port, '127.0.0.1', () => resolve(server));
+                }, 1000);
+            } else {
+                reject(e);
+            }
+        });
         server.listen(port, '127.0.0.1', () => {
             resolve(server);
         });
-        server.on('error', reject);
     });
 }
 
@@ -797,8 +856,8 @@ async function getStreamInfo() {
         info('⚡', 'Direct M3U8 URL detected — bypassing headless browser');
         const httpHeaders = {
             'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-            'referer':    'https://pooembed.eu/',
-            'origin':     'https://pooembed.eu',
+            'referer':    config.defaultReferer || 'https://pooembed.eu/',
+            'origin':     config.defaultOrigin  || 'https://pooembed.eu',
             'accept':     '*/*',
             'cache-control': 'no-cache',
             'pragma':     'no-cache',
@@ -817,6 +876,7 @@ async function getStreamInfo() {
     }
 
     step('BROWSER', 'Initializing stealth Puppeteer instance...');
+    if (activeBrowser) { await activeBrowser.close().catch(() => {}); activeBrowser = null; }
     const browser = await puppeteer.launch({
         headless: 'new',
         args: [
@@ -828,6 +888,7 @@ async function getStreamInfo() {
         ],
         ignoreDefaultArgs: ['--enable-automation'],
     });
+    activeBrowser = browser;
 
     try {
         const page = await browser.newPage();
@@ -995,6 +1056,7 @@ async function getStreamInfo() {
             info('🍪', `Extracted ${cdnCookies.length} CDN auth cookies for ${cdnHost}`);
         }
         await browser.close();
+        activeBrowser = null;
 
         const variant = await selectBestVariant(masterUrl, httpHeaders);
         return {
@@ -1009,6 +1071,7 @@ async function getStreamInfo() {
         };
     } catch (e) {
         await browser.close().catch(() => {});
+        activeBrowser = null;
         throw e;
     }
 }
@@ -1291,7 +1354,7 @@ async function runPipeline(streamData) {
         const s = d.toString().trim();
         if (s && !s.includes('non monoton') && !s.includes('DTS') && !s.includes('Past duration') && !s.includes('changing to')) {
             ffErrors.push(s.substring(0, 120));
-            if (ffErrors.length > 20) ffErrors = ffErrors.slice(-20);
+            if (ffErrors.length > 20) ffErrors.shift();
             dash.lastErr = ffErrors[ffErrors.length - 1];
         }
     });
@@ -1311,6 +1374,48 @@ async function runPipeline(streamData) {
         host: (() => { try { return new URL(streamData.videoUrl).hostname; } catch { return '?'; } })(),
         lastErr: '',
     });
+
+    // ── Discord stream connection watchdog ──
+    // playStream only resolves when FFmpeg ends, but the underlying StreamConnection
+    // WebSocket can close with a non-resumable code (e.g. 4014), setting _closed=true
+    // and permanently killing the WebRTC peer. sendVideoFrame/sendAudioFrame then
+    // silently no-op forever. This watchdog detects that and kills FFmpeg to force restart.
+    let discordConnDeadSince = 0;
+    const discordWatchdog = setInterval(() => {
+        if (isShuttingDown) return;
+        const streamConn = streamer.voiceConnection?.streamConnection;
+        if (!streamConn) return;
+        if (streamConn._closed === true) {
+            if (discordConnDeadSince === 0) discordConnDeadSince = Date.now();
+            if (Date.now() - discordConnDeadSince >= 5000) {
+                clearInterval(discordWatchdog);
+                info('💀', 'Discord stream connection closed non-resumably. Force restarting...');
+                if (currentPlayer) try { currentPlayer.kill('SIGKILL'); } catch {}
+            }
+        } else {
+            discordConnDeadSince = 0;
+        }
+    }, 2000);
+
+    // ── Voice connection watchdog ──
+    // If the bot is kicked from the voice channel entirely, voiceConnection goes
+    // undefined or its _closed flag is set. The stream watchdog above skips when
+    // streamConn is null, so this separate watchdog catches that case.
+    let voiceConnDeadSince = 0;
+    const voiceWatchdog = setInterval(() => {
+        if (isShuttingDown) return;
+        const vc = streamer.voiceConnection;
+        if (!vc || vc._closed === true) {
+            if (voiceConnDeadSince === 0) voiceConnDeadSince = Date.now();
+            if (Date.now() - voiceConnDeadSince >= 5000) {
+                clearInterval(voiceWatchdog);
+                info('💀', 'Voice connection lost (bot kicked or disconnected). Force restarting...');
+                if (currentPlayer) try { currentPlayer.kill('SIGKILL'); } catch {}
+            }
+        } else {
+            voiceConnDeadSince = 0;
+        }
+    }, 2000);
 
     const stallWatchdog = setInterval(() => {
         if (isShuttingDown) return;
@@ -1335,10 +1440,18 @@ async function runPipeline(streamData) {
             setTimeout(() => process.exit(42), 500);
             return;
         }
+        // Stale playlist detection: CDN returning the same playlist with no new segments
+        if (hlsProxyVideo?._playlistStaleSince > 60000) {
+            clearInterval(stallWatchdog);
+            info('⚠️ ', 'CDN playlist stale for >60s — segments are not advancing. Forcing restart.');
+            if (currentPlayer) try { currentPlayer.kill('SIGKILL'); } catch {}
+        }
     }, 3000);
 
     player.on('close', (code, signal) => {
         clearInterval(stallWatchdog);
+        clearInterval(discordWatchdog);
+        clearInterval(voiceWatchdog);
         stopDash();
         
         info(code === 0 ? '🏁' : '⚠️ ', `FFmpeg terminated (Code: ${code}, Signal: ${signal||'-'}, Processed: ${fmtBytes(dash.totalOut)})`);
@@ -1359,7 +1472,16 @@ async function runPipeline(streamData) {
         });
         info('✅', 'FFmpeg output active — injecting into Discord (DAVE E2EE)');
 
-        await playStream(ffOut, streamer, { type: 'go-live', format: 'nut' });
+        // Timeout guard: createStream() inside playStream can hang forever if
+        // Discord never sends STREAM_CREATE or STREAM_SERVER_UPDATE gateway events.
+        await new Promise((resolve, reject) => {
+            const timer = setTimeout(() => {
+                reject(new Error('playStream timed out — Discord stream setup hung'));
+            }, PLAY_STREAM_INIT_TIMEOUT_MS);
+            playStream(ffOut, streamer, { type: 'go-live', format: 'nut' })
+                .then((r) => { clearTimeout(timer); resolve(r); })
+                .catch((e) => { clearTimeout(timer); reject(e); });
+        });
     } catch (e) {
         stopDash();
         const msg = e.message || '';
@@ -1372,6 +1494,8 @@ async function runPipeline(streamData) {
 
     // ── Cleanup ──
     clearInterval(stallWatchdog);
+    clearInterval(discordWatchdog);
+    clearInterval(voiceWatchdog);
     stopDash();
     if (hlsProxyVideo)  {
         try { hlsProxyVideo.stop(); hlsProxyVideo.output.destroy(); } catch {}
@@ -1393,10 +1517,16 @@ async function runPipeline(streamData) {
         await new Promise(r => setTimeout(r, 5000));
         if (!isShuttingDown) {
             try {
+                // Re-join voice if connection was lost (kicked, disconnected, etc.)
+                if (!streamer.voiceConnection || streamer.voiceConnection._closed) {
+                    info('🔗', 'Voice connection lost — re-joining...');
+                    await streamer.joinVoice(config.guildId, config.channelId);
+                    info('🔗', 'Voice channel re-connected');
+                }
                 const fresh = await getStreamInfo();
-                runPipeline(fresh);
+                await runPipeline(fresh);
             } catch (e) {
-                info('❌', `Critical scrape failure on restart: ${e.message}`);
+                info('❌', `Critical failure on restart: ${e.message}`);
                 if (!isShuttingDown) process.exit(1);
             }
         }

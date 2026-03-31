@@ -851,7 +851,7 @@ async function handleSession(event, futureEvents) {
     }
 
     info('🏁', `Session window ended for: ${event.summary}`);
-    await killStreamer();
+    if (!isShuttingDown) await killStreamer();
 }
 
 // ══════════════════════════════════════════════════════════════════
